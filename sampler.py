@@ -36,6 +36,8 @@ def str2fx(xstr):
     1 - x[0] - x[1]
     
     convert it to a callable function
+
+    :input xstr: A string representing a numerical constraint g(x) <= 0
     
     """
     def f(x):
@@ -46,6 +48,17 @@ def str2fx(xstr):
 def read_constraints(fn):
     """\
     Grab the dimensionality and constraints from a given file. 
+
+    :input fn: Path to a file of the format:
+       dim
+       example_point
+       g1(x)
+       g2(x)
+       # optional comments
+       g3(x)
+       ...
+
+    :returns: A dictionary with the dimension and constraint objects
     
     """
     gs = list()
@@ -66,6 +79,11 @@ def subset_accepting(X, constraint_fx):
     """\
     Given a set of points, and constrants g(x) [as callable functions], subset just to the
     points that fall into the valid volume
+
+    :input X:              a N x dim matrix of test points
+    :input constraint_fx:  a list of callable functions, evaluating to a scalar
+
+    :returns: The subset of X for which every function in constraint_fx is >= 0
     
     """
     constraint_mat = np.vstack([np.apply_along_axis(c, 1, X) < 0 for c in constraint_fx])
@@ -73,9 +91,14 @@ def subset_accepting(X, constraint_fx):
     return X[in_region, :]
 
 
-def uniform(dim, const_str, const_fx, K, *args):
+def uniform(dim, const_str, const_fx, K):
     """\
     Baseline uniform sampling on the hypercube
+
+    :input dim:       The dimensionality
+    :input const_str: Constraint strings, included for API compatibility
+    :input const_fx:  Constraint callables, included for API compatibility
+    :input K:         Number of points to sample
 
     """
     return np.random.uniform(size=(K, dim))
@@ -86,6 +109,16 @@ def MCMC(dim, const_str, const_fx, K, chains=3, cores=3):
     MCMC sampling, with potentials lowering the probability
     of drawing failing points
 
+    :input dim:       The dimensionality
+    :input const_str: Constraint strings; used to define potentials
+    :input const_fx:  Constraint callables, included for API compatibility
+    :input K:         Number of points to sample
+    :input chains:    Number of independent MCMC chains to run
+    :input cores:     Number of CPU cores to run for parallelization
+
+    :returns: A set of points X drawn from the potential -c*g_i; for c=[1, 10, 20].
+              This involves three successive samplings, which should total K draws.
+
     """
     lambda_values = [1, 10, 20]
     k = int(K/(chains*len(lambda_values)))
@@ -95,7 +128,7 @@ def MCMC(dim, const_str, const_fx, K, chains=3, cores=3):
             x = pm.Uniform('x', shape=dim)
             for i, const in enumerate(const_str):
                 cname = 'g%d' % i
-                g = pm.Deterministic(cname, eval(const))
+                g = pm.Deterministic(cname, eval(const, {'__builtins__': None}, {'x': x } ))
                 pname = '%s_pot' % cname
                 pm.Potential(pname, tt.switch(tt.lt(g, 0), lam*g, 0))
             trace = pm.sample(k, tune=1000, chains=chains, cores=cores)
@@ -108,12 +141,25 @@ def VINormal(dim, const_str, const_fx, K, nfit=30000):
     Normal (full-rank) sampling, fit with ADVI to a
     high-potential probability distribution
 
+
+
+    :input dim:       The dimensionality
+    :input const_str: Constraint strings; used to define potentials
+    :input const_fx:  Constraint callables, included for API compatibility
+    :input K:         Number of points to sample
+    :input nfit:      Number of gradient iterations for variational inference
+
+    :returns: A set of points X drawn from a N(μ,Σ); where the parameters are fit
+              by variational inference to match the potential distribution formed
+              by the potentials -c*g_i; for c=7500
+
+
     """
     with pm.Model() as mod:
         x = pm.Uniform('x', shape=dim)
         for i, const in enumerate(const_str):
             cname = 'g%d' % i
-            g = pm.Deterministic(cname, eval(const))
+            g = pm.Deterministic(cname, eval(const, {'__builtins__': None}, {'x': x } ))
             pname = '%s_pot' % cname
             pm.Potential(pname, tt.switch(tt.lt(g, 0), 7500*g, 0))
         fit_res = pm.fit(nfit, method='fullrank_advi', obj_n_mc=3)
@@ -122,6 +168,25 @@ def VINormal(dim, const_str, const_fx, K, nfit=30000):
 
 
 def switch_method(params, k_wanted):
+    """\
+    Determine an efficient method to use. 
+
+    High volume acceptance regions should juse use plain rejection sampling, 
+      to minimize bias.
+
+    Moderate volume regions should use potential+NUTS to boost acceptance
+      rate and keep approximate uniformity in region.
+
+    Low volume regions should use variational inference to track to the mode.
+
+    :input params: The setting parameters (dimension, constraints, constraint functions)
+                   (a dictionary)
+    :input k_wanted: The number of samples the user wants provided
+
+    :returns: A callable function with the arguments (dim, constraints, constraint functions, K, *args)
+              corresponding to the (likely) most efficient means of sampling
+
+    """
     Xtest = uniform(params['dim'], params['constraints'], params['constraints_fx'], K=10000)
     Xtest = subset_accepting(Xtest, params['constraints_fx'])
     p_accept = Xtest.shape[0]/10000.
@@ -141,16 +206,45 @@ def switch_method(params, k_wanted):
         return VINormal
 
 
-def sample_until(sampler, params, K):
+def sample_until(sampler, params, K, maxit=5):
+    """\
+    Given a sampler and a target number of valid points, call the sampler
+    until at least 80%% of that target is reached.
+
+    :input sampler: A callable sampling function (see `switch_method`)
+    :input params:  The setting parameters (see `switch_method`)
+    :input K:       The desired number of valid points
+    :input maxit:   The maximum number of iterations
+
+    :returns: A matrix of valid points sampled from the region
+    :raises: ValueError if no valid points were found
+
+    """
     X = sampler(params['dim'], params['constraints'], params['constraints_fx'], K*2)
     X_acc = subset_accepting(X, params['constraints_fx'])
-    while X_acc.shape[0] < 0.8*K:
+    for _ in range(maxit):
+        if X_acc.shape[0] > 0.8*K:
+            break
         X_new = sampler(params['dim'], params['constraints'], params['constraints_fx'], K)
         X_acc = np.vstack([X_acc, subset_accepting(X_new, params['constraints_fx'])])
+    if X_acc.shape[0] == 0:
+        raise ValueError('No valid points identified after %d iterations. Check that region is feasible.' % maxit)
     return X_acc
 
 
 def get_landmarks(X, constraint_fx, forget=3, k_landmarks=1000):
+    """\
+    Given a set of points X, subset to a set of `k_landmarks` landmark points,
+    chosen greedily at each step to maximize the total distance.
+
+    :input X:             A set of points
+    :input constraint_fx: A list of callable constraints, g, such that g(x) > 0 represents validity
+    :input forget:        Perform this many "choose most distant point" iterations before starting
+    :input k_landmarks:   The desired number of landmarks
+
+    :returns:  A matrix X, with `k_landmarks` rows, containing the thinned and homogenized
+               landmarks of X
+    """
     Xp = subset_accepting(X, constraint_fx)
     landmark_set = list()
     landmark_dist = np.zeros((Xp.shape[0],))
@@ -168,13 +262,21 @@ def get_landmarks(X, constraint_fx, forget=3, k_landmarks=1000):
     return Xp[np.array(landmark_set),:]
 
 
-
 def meddist(X_pass):
+    """Calculate median distance between point pairs in X_pass"""
     return np.median(sp.spatial.distance_matrix(X_pass, X_pass))
 
 
-
 def as_theano_f(const):
+    """\
+    Convert a formula string (0.07 + x[0]*x[1])/(0.02 + x[2]) to a callable function
+    which will work within a theano context to broadcast along rows, i.e.
+
+    (0.07 + x[:,0]*x[:,1])/(0.02 + x[:,2])
+
+    :input const: The string representing the constraint
+
+    """
     const = const.replace('[', '[:,')
     def g(Xo):
         return eval(const, {'__builtins__': None}, {'x': Xo} )
@@ -182,6 +284,21 @@ def as_theano_f(const):
 
 
 def refine_landmarks(X, constraint_str, iters):
+    """\
+    Refine a set of *valid* points X by directly maximizing the average inter-point distance;
+    subject to boundary functions.
+
+    ** No checking is performed on the validity of X **
+
+    :input X:              A matrix of valid points (all constraints > 0)
+    :input constraint_str: The list of constraint strings for the target volume
+    :input iters:          The number of gradient descent iterations
+
+    :returns: A matrix of refined points; some of which will now be invalid; but
+              of which the *valid* points should be more homogenous than
+              the inputs
+
+    """
     theano.config.compute_test_value = 'ignore'
     Xi = tt.matrix('base_input')
     Delta = theano.shared(0*X)
