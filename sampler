@@ -1,0 +1,6 @@
+#!/bin/bash
+input=$1
+output=$2
+n_points=$3
+
+python sampler.py $input $output $n_points
