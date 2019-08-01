@@ -86,7 +86,10 @@ def subset_accepting(X, constraint_fx):
     :returns: The subset of X for which every function in constraint_fx is >= 0
     
     """
-    constraint_mat = np.vstack([np.apply_along_axis(c, 1, X) < 0 for c in constraint_fx])
+    # add in hypercube constraints
+    constraints = constraint_fx + [(lambda x: x[i]) for i in range(X.shape[1])]
+    constraints += [(lambda x: 1 - x[i]) for i in range(X.shape[1])]
+    constraint_mat = np.vstack([np.apply_along_axis(c, 1, X) < 0 for c in constraints])
     in_region = np.logical_not(np.apply_along_axis(np.any, 0, constraint_mat))
     return X[in_region, :]
 
